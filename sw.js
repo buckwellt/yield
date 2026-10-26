@@ -1,6 +1,6 @@
 // Yield service worker: cache-first app shell, fully offline.
 // Bump VERSION whenever any precached file changes so clients pick up the update.
-const VERSION = "v1";
+const VERSION = "v2";
 const CACHE = `yield-${VERSION}`;
 const PRECACHE = [
   "./",

@@ -132,12 +132,32 @@ nav {
 nav ul {
   width: min(100%, 28rem); margin: 0 auto; display: flex;
 }
+nav li { flex: 1; }
 nav a {
-  min-height: 3.5rem; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  width: 100%; min-height: 3.5rem; display: flex; flex-direction: column; align-items: center; justify-content: center;
   gap: 0.15rem; text-decoration: none; font-size: 0.75rem; font-weight: 500; color: var(--muted);
 }
 nav a[aria-current="page"] { color: var(--fg); }
 nav svg { width: 1.25rem; height: 1.25rem; fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+.placeholder { background: var(--inset); color: var(--muted); cursor: default; }
+.rate-head { margin-top: 1.25rem; }
+.stale { margin-top: 1.25rem; }
+.backup-area {
+  margin-top: 0.75rem; width: 100%; min-height: 6rem; padding: 0.6rem 0.75rem;
+  border-radius: 12px; border: 1px solid var(--border); background: var(--bg);
+  font-size: 0.875rem; font-family: ui-monospace, Menlo, monospace;
+}
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.toast {
+  position: fixed; z-index: 5; left: 50%; transform: translateX(-50%);
+  top: calc(0.75rem + env(safe-area-inset-top)); width: min(calc(100% - 2rem), 26rem);
+  display: flex; align-items: center; gap: 0.75rem;
+  background: var(--ink); color: var(--ink-fg); border-radius: 14px; padding: 0.7rem 0.9rem;
+  font-size: 0.875rem; box-shadow: 0 6px 24px rgb(0 0 0 / 0.18);
+}
+.toast[hidden] { display: none; }
+.toast p { flex: 1; }
+.toast button { flex: none; min-height: 2.75rem; padding: 0 0.75rem; border: 0; border-radius: 10px; background: var(--ink-fg); color: var(--ink); font-weight: 500; cursor: pointer; }
 .rise { animation: rise 250ms cubic-bezier(0.22, 1, 0.36, 1); }
 @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 @media (prefers-reduced-motion: reduce) {
@@ -170,6 +190,10 @@ const RATING_LABEL = {
 const UNILATERAL_NOTE = "Unilateral is parked. One side would twist you and load the pelvis unevenly, so both sides stay together.";
 const DWELL_MS = 7 * 24 * 60 * 60 * 1000;
 const TEN_MIN_MS = 10 * 60 * 1000;
+const STALE_MS = 2 * 60 * 60 * 1000;
+const HISTORY_MAX = 500;
+const BACKUP_NAG_MS = 14 * 24 * 60 * 60 * 1000;
+const TAP_GUARD_MS = 400;
 
 function reps(id, name, load, amount, pauseAt, cues) {
     return { id, name, load, mode: "reps", amount, pauseAt, cues };
@@ -604,6 +628,8 @@ function createInitialState() {
         chains: {},
         history: [],
         active: null,
+        backupAt: null,
+        persistAsked: false,
     };
 }
 function clamp(n, min, max) {
@@ -645,20 +671,28 @@ function cleanActive(active) {
         return null;
     return active;
 }
+function clampKg(n, max, fallback) {
+    const v = Number(n);
+    if (!Number.isFinite(v))
+        return fallback;
+    return Math.min(max, Math.max(0, Math.round(v * 2) / 2));
+}
 function ensure(state, now) {
     const createdAt = state.createdAt ?? now;
     return {
         createdAt,
         gear: {
-            dumbbellKg: clamp(state.gear?.dumbbellKg ?? 5, 0, 40),
-            kettlebellKg: clamp(state.gear?.kettlebellKg ?? 8, 0, 48),
+            dumbbellKg: clampKg(state.gear?.dumbbellKg ?? 5, 40, 5),
+            kettlebellKg: clampKg(state.gear?.kettlebellKg ?? 8, 48, 8),
         },
         offset: clamp(state.offset ?? 0, 0, 100000),
         cycle: clamp(state.cycle || 1, 1, 100000),
         nextSlot: mod(state.nextSlot ?? 0, SLOTS.length),
         chains: withAllChains(state.chains ?? {}, createdAt),
-        history: Array.isArray(state.history) ? state.history.slice(0, 12) : [],
+        history: Array.isArray(state.history) ? state.history.slice(0, HISTORY_MAX) : [],
         active: cleanActive(state.active),
+        backupAt: typeof state.backupAt === "string" ? state.backupAt : null,
+        persistAsked: state.persistAsked === true,
     };
 }
 function formatKg(kg) {
@@ -997,6 +1031,21 @@ function decideClimb(chain, progress, gear, nowMs) {
         outcome: stayed,
     };
 }
+function decideDrop(chain, progress) {
+    const hard = progress.ratings.slice(-3).filter((item) => item.rating === "hard").length;
+    if (hard < 2)
+        return null;
+    const why = "Two of the last three felt hard";
+    if (progress.tierIndex > 0) {
+        const next = { rungIndex: progress.rungIndex, tierIndex: progress.tierIndex - 1 };
+        return { ...next, drop: true, reason: `${why}, so the protocol steps back one.`, outcome: `Back to ${stepName(chain, next)}` };
+    }
+    if (progress.rungIndex > 0) {
+        const next = { rungIndex: progress.rungIndex - 1, tierIndex: 0 };
+        return { ...next, drop: true, reason: `${why}, so the ladder steps back one rung.`, outcome: `Back to ${stepName(chain, next)}` };
+    }
+    return { drop: false, reason: `${why}. This is already the first step, so it stays.`, outcome: `Stayed on ${stepName(chain, progress)}` };
+}
 function nextClimbText(chain, progress, gear) {
     const next = chain.rungs[progress.rungIndex + 1];
     if (next && resolveLoad(next.load, gear).ok)
@@ -1034,6 +1083,22 @@ function applyOne(chains, move, rating, gear, now, nowMs) {
         ...prev,
         ratings: [...prev.ratings, { at: now, rating }],
     };
+    const drop = decideDrop(chain, progress);
+    if (drop) {
+        chains[chain.id] = drop.drop
+            ? { rungIndex: drop.rungIndex, tierIndex: drop.tierIndex, since: now, ratings: [] }
+            : progress;
+        return {
+            chainId: chain.id,
+            family: chain.family,
+            groupLabel: group.label,
+            rating,
+            climbed: false,
+            dropped: drop.drop,
+            outcome: drop.outcome,
+            reason: drop.reason,
+        };
+    }
     const decision = decideClimb(chain, progress, gear, nowMs);
     if (decision.climb === "rung") {
         chains[chain.id] = {
@@ -1064,15 +1129,18 @@ function applyOne(chains, move, rating, gear, now, nowMs) {
         reason: decision.reason,
     };
 }
-function finishSession(state, now) {
+function finishSession(state, now, partial = false) {
     const active = state.active;
     if (!active || active.committed)
         return state;
-    if (active.ratings.some((rating) => rating == null))
+    if (!partial && active.ratings.some((rating) => rating == null))
         return state;
+    const rated = active.moves.map((move, index) => [move, active.ratings[index]]).filter(([, rating]) => rating != null);
+    if (rated.length === 0)
+        return { ...state, active: null };
     const nowMs = new Date(now).getTime();
     const chains = { ...state.chains };
-    const results = active.moves.map((move, index) => applyOne(chains, move, active.ratings[index], state.gear, now, nowMs));
+    const results = rated.map(([move, rating]) => applyOne(chains, move, rating, state.gear, now, nowMs));
     let nextSlot = state.nextSlot;
     let cycle = state.cycle;
     if (active.kind === "slot") {
@@ -1095,7 +1163,7 @@ function finishSession(state, now) {
             ...active,
             committed: true,
             results,
-            finishedAt: now,
+            finishedAt: partial ? active.lastAt || active.startedAt : now,
             phase: "done",
         },
     };
@@ -1112,14 +1180,14 @@ function applyRating(state, rating, now) {
         return state;
     const ratings = [...active.ratings];
     ratings[active.cursor] = rating;
-    const next = { ...state, active: { ...active, ratings } };
+    const next = { ...state, active: { ...active, ratings, lastAt: now } };
     if (active.cursor + 1 < active.moves.length) {
         return {
             ...next,
             active: { ...next.active, cursor: active.cursor + 1, phase: "do" },
         };
     }
-    return finishSession(next, now);
+    return logSession(finishSession(next, now));
 }
 function undoRating(state) {
     const active = state.active;
@@ -1135,34 +1203,54 @@ function sessionTitle(kind, slot) {
         return "Go again";
     return SLOTS[mod(slot ?? 0, SLOTS.length)].title;
 }
-function dismissSession(state) {
+// Writes the finished session into history once. Safe to call repeatedly.
+function logSession(state) {
     const active = state.active;
-    if (!active?.committed || !active.finishedAt || !active.results) {
-        return { ...state, active: null };
-    }
+    if (!active?.committed || active.logged || !active.finishedAt || !active.results)
+        return state;
+    const elapsed = new Date(active.finishedAt).getTime() - new Date(active.startedAt).getTime();
     const record = {
-        id: `${active.finishedAt}-${active.offset}`,
         kind: active.kind,
         slot: active.slot,
         cycle: active.cycle,
         offset: active.offset,
-        startedAt: active.startedAt,
         finishedAt: active.finishedAt,
-        elapsedMs: Math.max(0, new Date(active.finishedAt).getTime() - new Date(active.startedAt).getTime()),
+        elapsedMs: Math.min(STALE_MS, Math.max(0, elapsed || 0)),
         title: sessionTitle(active.kind, active.slot),
         climbs: active.results.filter((item) => item.climbed).map((item) => item.family),
     };
+    const drops = active.results.filter((item) => item.dropped).map((item) => item.family);
+    if (drops.length)
+        record.drops = drops;
+    if (active.results.length < active.moves.length) {
+        record.done = active.results.length;
+        record.of = active.moves.length;
+    }
     return {
         ...state,
-        active: null,
-        history: [record, ...state.history].slice(0, 12),
+        active: { ...active, logged: true },
+        history: [record, ...state.history].slice(0, HISTORY_MAX),
     };
 }
+function dismissSession(state) {
+    return { ...logSession(state), active: null };
+}
+function isStale(active, nowMs) {
+    if (!active || active.committed)
+        return false;
+    return nowMs - new Date(active.startedAt).getTime() > STALE_MS;
+}
 function formatElapsed(ms) {
+    if (!Number.isFinite(ms))
+        return "";
+    if (ms >= STALE_MS)
+        return "2h+";
     const total = Math.max(0, Math.floor(ms / 1000));
-    const m = Math.floor(total / 60);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
     const s = total % 60;
-    return `${m}:${s.toString().padStart(2, "0")}`;
+    const ss = s.toString().padStart(2, "0");
+    return h ? `${h}:${m.toString().padStart(2, "0")}:${ss}` : `${m}:${ss}`;
 }
 function formatWhen(iso) {
     const date = new Date(iso);
@@ -1177,6 +1265,13 @@ let view = "today";
 let confirmDiscard = false;
 let focusHeading = false;
 let clockTimer = 0;
+let guardUntil = 0;
+let sessionKey = "";
+let saveFailed = false;
+let pendingImport = null;
+let copyFallback = "";
+let storagePersisted = null;
+let toastTimer = 0;
 
 function esc(value) {
   return String(value).replace(/[&<>"']/g, (ch) => {
@@ -1188,19 +1283,59 @@ function esc(value) {
   });
 }
 
+function snapshot(from) {
+  return {
+    createdAt: from.createdAt,
+    gear: from.gear,
+    offset: from.offset,
+    cycle: from.cycle,
+    nextSlot: from.nextSlot,
+    chains: from.chains,
+    history: from.history,
+    active: from.active,
+    backupAt: from.backupAt,
+    persistAsked: from.persistAsked,
+  };
+}
+
 function persist(next) {
   state = next;
-  const saved = {
-    createdAt: state.createdAt,
-    gear: state.gear,
-    offset: state.offset,
-    cycle: state.cycle,
-    nextSlot: state.nextSlot,
-    chains: state.chains,
-    history: state.history,
-    active: state.active,
-  };
-  localStorage.setItem(KEY, JSON.stringify({ state: saved, version: 0 }));
+  try {
+    localStorage.setItem(KEY, JSON.stringify({ state: snapshot(state), version: 0 }));
+    if (saveFailed) {
+      saveFailed = false;
+      hideToast();
+    }
+    return true;
+  } catch (err) {
+    console.warn("Save failed", err);
+    if (!saveFailed) {
+      saveFailed = true;
+      showToast("Could not save on this phone. Storage may be full or blocked. Export a backup from Gear.", { sticky: true, action: "OK" });
+    }
+    return false;
+  }
+}
+
+function showToast(message, options = {}) {
+  let el = document.getElementById("toast");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "toast";
+    el.className = "toast";
+    el.setAttribute("role", "status");
+    el.setAttribute("aria-live", "polite");
+    document.body.appendChild(el);
+  }
+  window.clearTimeout(toastTimer);
+  el.innerHTML = `<p>${esc(message)}</p>${options.action ? `<button type="button" data-toast="${esc(options.act || "close")}">${esc(options.action)}</button>` : ""}`;
+  el.hidden = false;
+  if (!options.sticky) toastTimer = window.setTimeout(hideToast, 3500);
+}
+
+function hideToast() {
+  const el = document.getElementById("toast");
+  if (el) el.hidden = true;
 }
 
 function load() {
@@ -1212,9 +1347,12 @@ function load() {
     raw = null;
   }
   const saved = raw && raw.state ? raw.state : raw || createInitialState();
-  const next = ensure(saved, saved.createdAt || now);
+  let next = ensure(saved, saved.createdAt || now);
+  // A session finished by an older version, but never dismissed, goes into history now.
+  const unlogged = next.active?.committed && !next.active.logged;
+  if (unlogged) next = logSession(next);
   state = next;
-  if (!saved.createdAt) persist(next);
+  if (!saved.createdAt || unlogged) persist(next);
 }
 
 function readRoute() {
@@ -1233,7 +1371,7 @@ function go(route) {
 
 function syncRoute() {
   view = readRoute();
-  if (view === "session" && !state.active) {
+  if (view === "session" && (!state.active || (!sessionKey && isStale(state.active, Date.now())))) {
     view = "today";
     if (location.hash !== "#/today") history.replaceState(null, "", "#/today");
   }
@@ -1249,7 +1387,7 @@ function tickClock() {
   const active = state.active;
   if (!el || !active || active.phase === "done") return;
   const elapsed = Date.now() - new Date(active.startedAt).getTime();
-  el.textContent = formatElapsed(elapsed) + (elapsed >= TEN_MIN_MS ? " · past ten" : "");
+  el.textContent = formatElapsed(elapsed) + (elapsed >= TEN_MIN_MS && elapsed < STALE_MS ? " · past ten" : "");
 }
 
 function startClock() {
@@ -1276,17 +1414,29 @@ function todayHTML() {
   const ready = ensure(state, now);
   const slot = lineupMeta(ready, "slot");
   const again = lineupMeta(ready, "again");
-  const active = ready.active;
+  // A committed session is already in history, so Today moves on to the next lineup.
+  const active = ready.active && !ready.active.committed ? ready.active : null;
+  const stale = isStale(active, Date.now());
   const moves = active ? active.moves : buildMoves(ready, "slot");
   const title = active ? sessionTitle(active.kind, active.slot) : slot.title;
-  const blurb = active
-    ? `Move ${active.phase === "done" ? active.moves.length : active.cursor + 1} of ${active.moves.length}. Pick up where you left off.`
-    : `${slot.blurb} Five moves, one set each, near ten minutes.`;
-  const actions = active
-    ? `<button type="button" class="btn primary" data-act="resume">Resume</button>`
-    : `<button type="button" class="btn primary" data-act="start-slot">Start</button>
+  const doneCount = active ? active.ratings.filter((rating) => rating != null).length : 0;
+  const blurb = stale
+    ? `Started ${formatWhen(active.startedAt)}, too long ago to pick up. ${doneCount} of ${active.moves.length} moves rated.`
+    : active
+      ? `Move ${active.cursor + 1} of ${active.moves.length}. Pick up where you left off.`
+      : `${slot.blurb} Five moves, one set each, near ten minutes.`;
+  const actions = stale
+    ? `${doneCount ? `<button type="button" class="btn primary" data-act="stale-finish">Finish, save ${doneCount} of ${active.moves.length}</button>` : ""}
+       <button type="button" class="btn ${doneCount ? "secondary" : "primary"}" data-act="stale-discard">Discard</button>
+       <p class="center muted">${doneCount ? "Finish logs the rated moves and moves the lineup on." : "Nothing was rated, so there is nothing to save."}</p>`
+    : active
+      ? `<button type="button" class="btn primary" data-act="resume">Resume</button>`
+      : `<button type="button" class="btn primary" data-act="start-slot">Start</button>
        <button type="button" class="btn secondary" data-act="start-again">Go again</button>
        <p class="center muted">${esc(again.blurb)}</p>`;
+  const nag = ready.history.length && backupDue(ready)
+    ? `<p class="fine center"><a href="#/gear" class="accent">${esc(ready.backupAt ? `Last backup ${formatWhen(ready.backupAt)}. Time for a fresh one.` : "No backup yet. Save one in Gear.")}</a></p>`
+    : "";
   const recent =
     ready.history.length === 0
       ? ""
@@ -1297,12 +1447,10 @@ function todayHTML() {
             .map(
               (session) => `<li class="row">
               <div class="split">
-                <p class="name">${esc(session.title)}</p>
+                <p class="name">${esc(session.title || sessionTitle(session.kind, session.slot))}</p>
                 <p class="nums muted">${esc(formatElapsed(session.elapsedMs))}</p>
               </div>
-              <p class="muted">${esc(formatWhen(session.finishedAt))}${
-                session.climbs.length ? ` · ${esc(session.climbs.join(", "))} climbed` : " · no climbs"
-              }</p>
+              <p class="muted">${esc(recentLine(session))}</p>
             </li>`,
             )
             .join("")}</ul>
@@ -1311,14 +1459,26 @@ function todayHTML() {
       <h1 class="word">Yield</h1>
       <p class="kicker">Cycle ${esc(ready.cycle)}</p>
     </header>
-    <p class="kicker space">${esc(active ? "Session underway" : slot.kicker)}</p>
+    <p class="kicker space">${esc(stale ? "Session left open" : active ? "Session underway" : slot.kicker)}</p>
     <h2 class="display">${esc(title)}</h2>
     <p class="lede">${esc(blurb)}</p>
+    <div class="stack">${actions}</div>
+    ${nag}
     <ul class="card list">${moves.map(moveRow).join("")}</ul>
     <p class="fine">Shown at the rung you have earned. Ladders holds the rest of each family.</p>
-    <div class="stack">${actions}</div>
     <p class="guard">No hinges, no twisting, and nothing that loads one side of the pelvis. Bridges stay on both feet and stop before the back arches.</p>
     ${recent}`;
+}
+
+function recentLine(session) {
+  const parts = [formatWhen(session.finishedAt)];
+  if (session.done != null) parts.push(`${session.done} of ${session.of} moves`);
+  const climbs = Array.isArray(session.climbs) ? session.climbs : [];
+  const drops = Array.isArray(session.drops) ? session.drops : [];
+  if (climbs.length) parts.push(`${climbs.join(", ")} climbed`);
+  if (drops.length) parts.push(`${drops.join(", ")} stepped back`);
+  if (!climbs.length && !drops.length) parts.push("no climbs");
+  return parts.filter(Boolean).join(" · ");
 }
 
 function marks(ratings) {
@@ -1370,7 +1530,7 @@ function laddersHTML() {
       <p class="kicker">Progress</p>
       <h1 class="display">Ladders</h1>
     </header>
-    <p class="lede">Each family runs easy to pro. It climbs when two of the last three appearances felt easy, and only after a week on that step. At the top, or when the next weight is more than you own, the load stays put and the protocol moves: more reps, tempo, pause, a bilateral stand-in for unilateral, then rest-pause.</p>
+    <p class="lede">Each family runs easy to pro. It climbs when two of the last three appearances felt easy, and only after a week on that step. At the top, or when the next weight is more than you own, the load stays put and the protocol moves: more reps, tempo, pause, a bilateral stand-in for unilateral, then rest-pause. When two of the last three felt hard, it steps back one.</p>
     <div class="groups">${groups}</div>`;
 }
 
@@ -1379,7 +1539,7 @@ function stepper(id, label, value, hint, dec, inc) {
     <label class="kicker" for="${id}">${esc(label)}</label>
     <div class="stepper">
       <button type="button" class="btn secondary square" data-act="${dec}" aria-label="Decrease ${esc(label)}">−</button>
-      <input id="${id}" inputmode="numeric" value="${esc(value)}" />
+      <input id="${id}" inputmode="decimal" value="${esc(formatKg(value))}" />
       <button type="button" class="btn secondary square" data-act="${inc}" aria-label="Increase ${esc(label)}">+</button>
     </div>
     <p class="fine">${esc(hint)}</p>
@@ -1397,7 +1557,7 @@ function gearHTML() {
     </header>
     <p class="lede">Dumbbells are per hand. The kettlebell is the one bell. A band is assumed. Saved on this phone. Nothing is sent anywhere. A session already underway keeps its plan.</p>
     <div class="stack">
-      ${stepper("db", "Dumbbell, kg each hand", ready.gear.dumbbellKg, "Zero means you have no dumbbells. A pair of 5kg is the default.", "db-dec", "db-inc")}
+      ${stepper("db", "Dumbbell, kg each hand", ready.gear.dumbbellKg, "Zero means you have no dumbbells. A pair of 5kg is the default. Half kilos are fine.", "db-dec", "db-inc")}
       ${stepper("kb", "Kettlebell, kg", ready.gear.kettlebellKg, "Zero means you have no kettlebell. Default is 8kg, so set the bell you actually have.", "kb-dec", "kb-inc")}
     </div>
     <section class="card pad">
@@ -1415,7 +1575,169 @@ function gearHTML() {
     <section class="block">
       <h2 class="h-lg">What was left out</h2>
       <p class="lede">Hinges, twists, and anything that loads one side of the pelvis. Overhead work is seated against a wall so the low back cannot arch into the press. Bridges stay bilateral and stop in a straight line from shoulder to knee. When a ladder asks for unilateral work, it is swapped for a bilateral one-and-a-half, and the note stays on the card.</p>
+    </section>
+    ${backupHTML(ready)}`;
+}
+
+function backupDue(from) {
+  if (!from.backupAt) return true;
+  return Date.now() - new Date(from.backupAt).getTime() > BACKUP_NAG_MS;
+}
+
+function canShareFiles() {
+  try {
+    return !!(navigator.canShare && navigator.canShare({ files: [new File(["{}"], "t.json", { type: "application/json" })] }));
+  } catch {
+    return false;
+  }
+}
+
+function backupHTML(ready) {
+  const share = canShareFiles();
+  const last = ready.backupAt ? formatWhen(ready.backupAt) : "never";
+  const days = ready.backupAt ? Math.floor((Date.now() - new Date(ready.backupAt).getTime()) / DAY_MS) : null;
+  const reminder = !backupDue(ready)
+    ? ""
+    : `<p class="callout">${esc(ready.backupAt ? `It has been ${days} days. A fresh copy keeps your ladders safe.` : "No backup yet. One file keeps your ladders if the phone clears its storage.")}</p>`;
+  const storage =
+    storagePersisted === true
+      ? "This phone has agreed to keep Yield's storage."
+      : storagePersisted === false
+        ? "This phone may clear Yield's storage if space runs low or the app sits unused, so keep a backup."
+        : "";
+  const confirm = pendingImport
+    ? `<div class="card pad">
+        <p>Backup from ${esc(pendingImport.from)}. ${esc(pendingImport.sessions)} ${pendingImport.sessions === 1 ? "session" : "sessions"}, cycle ${esc(pendingImport.cycle)}.</p>
+        <p class="note">Replace everything on this phone with it? What is here now will be gone.</p>
+        <div class="stack">
+          <button type="button" class="btn primary" data-act="import-yes">Replace</button>
+          <button type="button" class="btn secondary" data-act="import-no">Cancel</button>
+        </div>
+      </div>`
+    : "";
+  return `<section class="block" id="backup">
+      <h2 class="h-lg">Backup</h2>
+      <p class="lede">Everything lives in this phone's browser storage. iOS can clear it, so save a copy now and then.</p>
+      <p class="kicker space">Last backed up · ${esc(last)}</p>
+      ${reminder}
+      <div class="stack">
+        ${share ? `<button type="button" class="btn primary" data-act="export-share">Share backup</button>` : ""}
+        <button type="button" class="btn ${share ? "secondary" : "primary"}" data-act="export-download">Download backup file</button>
+        <button type="button" class="btn secondary" data-act="export-copy">Copy backup text</button>
+      </div>
+      ${copyFallback ? `<p class="fine">Copy did not go through. Select this text and copy it.</p><textarea class="backup-area" id="copy-text" readonly>${esc(copyFallback)}</textarea>` : ""}
+      <h3 class="h-lg block">Restore</h3>
+      <p class="lede">From a backup file, or paste the text.</p>
+      <div class="stack">
+        <label class="btn secondary" for="import-file">Choose backup file</label>
+        <input type="file" id="import-file" class="sr-only" accept="application/json,.json,text/plain" />
+        <textarea class="backup-area" id="import-text" placeholder="Paste backup text here" aria-label="Backup text"></textarea>
+        <button type="button" class="btn secondary" data-act="import-paste">Check pasted backup</button>
+      </div>
+      ${confirm}
+      ${storage ? `<p class="fine">${esc(storage)}</p>` : ""}
     </section>`;
+}
+
+function backupText() {
+  return JSON.stringify({ app: "yield", key: KEY, exportedAt: new Date().toISOString(), state: snapshot(fresh()) });
+}
+
+function backupName() {
+  return `yield-backup-${new Date().toISOString().slice(0, 10)}.json`;
+}
+
+function markBackedUp() {
+  const next = fresh();
+  next.backupAt = new Date().toISOString();
+  persist(next);
+  render();
+  showToast("Backup saved.");
+}
+
+async function exportBackup(how) {
+  const text = backupText();
+  copyFallback = "";
+  if (how === "share") {
+    try {
+      const file = new File([text], backupName(), { type: "application/json" });
+      await navigator.share({ files: [file], title: "Yield backup" });
+      markBackedUp();
+    } catch (err) {
+      if (err && err.name === "AbortError") return;
+      exportBackup("download");
+    }
+    return;
+  }
+  if (how === "download") {
+    const url = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = backupName();
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 10000);
+    markBackedUp();
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+    markBackedUp();
+    showToast("Backup copied. Paste it somewhere safe, like Notes.");
+  } catch {
+    copyFallback = text;
+    render();
+    const area = document.getElementById("copy-text");
+    if (area) area.select();
+  }
+}
+
+// Accepts an export file, the raw localStorage value, or a bare state object.
+function parseBackup(text) {
+  let raw;
+  try {
+    raw = JSON.parse(String(text || "").trim());
+  } catch {
+    return { error: "That is not a Yield backup. It should start with {." };
+  }
+  const candidate = raw && typeof raw === "object" && raw.state && typeof raw.state === "object" ? raw.state : raw;
+  const ok =
+    candidate &&
+    typeof candidate === "object" &&
+    !Array.isArray(candidate) &&
+    candidate.chains &&
+    typeof candidate.chains === "object" &&
+    !Array.isArray(candidate.chains) &&
+    Array.isArray(candidate.history) &&
+    candidate.gear &&
+    typeof candidate.gear === "object" &&
+    Object.keys(candidate.chains).some((id) => allChains().some((item) => item.chain.id === id));
+  if (!ok) return { error: "That file does not look like a Yield backup." };
+  const next = ensure(candidate, candidate.createdAt || new Date().toISOString());
+  if (next.active?.committed) next.active = null;
+  next.backupAt = typeof raw.exportedAt === "string" ? raw.exportedAt : next.backupAt;
+  next.persistAsked = state.persistAsked;
+  return {
+    state: next,
+    from: formatWhen(raw.exportedAt || next.history[0]?.finishedAt || next.createdAt) || "an unknown date",
+    sessions: next.history.length,
+    cycle: next.cycle,
+  };
+}
+
+function checkImport(text) {
+  const result = parseBackup(text);
+  if (result.error) {
+    pendingImport = null;
+    render();
+    showToast(result.error);
+    return;
+  }
+  pendingImport = result;
+  render();
+  const btn = document.querySelector('[data-act="import-yes"]');
+  if (btn) btn.scrollIntoView({ block: "center" });
 }
 
 function sessionHTML() {
@@ -1424,7 +1746,7 @@ function sessionHTML() {
   const elapsed = active.finishedAt
     ? new Date(active.finishedAt).getTime() - new Date(active.startedAt).getTime()
     : Date.now() - new Date(active.startedAt).getTime();
-  const over = active.phase !== "done" && elapsed >= TEN_MIN_MS;
+  const over = active.phase !== "done" && elapsed >= TEN_MIN_MS && elapsed < STALE_MS;
   const header = `<header class="split centerline">
     <button type="button" class="btn ghost" data-act="close">Close</button>
     <p id="clock" class="nums">${esc(formatElapsed(elapsed))}${over ? " · past ten" : ""}</p>
@@ -1461,7 +1783,10 @@ function sessionHTML() {
           <button type="button" class="btn primary" data-act="set-done">Set done</button>
           ${active.cursor > 0 ? `<button type="button" class="btn ghost" data-act="undo">Undo last rating</button>` : ""}
         </div>`
-      : `<h2 class="h-lg">How did that feel?</h2>
+      : `<div class="stack">
+          <p class="btn placeholder" aria-hidden="true">Set done</p>
+        </div>
+        <h2 class="h-lg rate-head">How did that feel?</h2>
         <div class="stack">
           <button type="button" class="btn secondary choice" data-act="rate" data-rating="easy"><span>Easy</span><span class="hint">Could have done more</span></button>
           <button type="button" class="btn secondary choice" data-act="rate" data-rating="solid"><span>Solid</span><span class="hint">The last reps were work</span></button>
@@ -1528,6 +1853,11 @@ function render() {
   root.innerHTML = `<div class="page">${page}</div>${inSession ? "" : navHTML()}`;
   stopClock();
   if (inSession && state.active && state.active.phase !== "done") startClock();
+  // Ignore taps for a moment after the session screen changes, so a double tap
+  // cannot land on the button that just appeared underneath.
+  const key = inSession && state.active ? `${state.active.startedAt}-${state.active.cursor}-${state.active.phase}` : "";
+  if (key && key !== sessionKey) guardUntil = Date.now() + TAP_GUARD_MS;
+  sessionKey = key;
   if (focusHeading) {
     focusHeading = false;
     const heading = root.querySelector("h1");
@@ -1544,21 +1874,29 @@ function fresh() {
 
 function setKg(which, value, max) {
   const next = fresh();
-  const n = Number(value);
-  const kg = Number.isFinite(n) ? Math.min(max, Math.max(0, Math.round(n))) : 0;
-  next.gear = { ...next.gear, [which]: kg };
+  const text = String(value).trim().replace(",", ".");
+  const n = text === "" ? NaN : Number(text);
+  if (!Number.isFinite(n) || n < 0) {
+    render();
+    showToast("Enter a weight in kg, like 12.5. Kept the old one.");
+    return;
+  }
+  next.gear = { ...next.gear, [which]: clampKg(n, max, next.gear[which]) };
   persist(ensure(next, new Date().toISOString()));
   render();
 }
+
+const GUARDED = new Set(["set-done", "rate", "undo", "dismiss"]);
 
 function onClick(event) {
   const target = event.target.closest("[data-act]");
   if (!target) return;
   const act = target.dataset.act;
+  if (GUARDED.has(act) && Date.now() < guardUntil) return;
   if (act === "start-slot" || act === "start-again") {
     const now = new Date().toISOString();
     const base = fresh();
-    if (!base.active) base.active = buildActive(base, act === "start-again" ? "again" : "slot", now);
+    if (!base.active || base.active.committed) base.active = buildActive(base, act === "start-again" ? "again" : "slot", now);
     confirmDiscard = false;
     persist(base);
     focusHeading = true;
@@ -1572,7 +1910,7 @@ function onClick(event) {
     return;
   }
   if (act === "close" || act === "dismiss") {
-    if (act === "dismiss") persist(dismissSession(fresh()));
+    if (act === "dismiss" || state.active?.committed) persist(dismissSession(fresh()));
     confirmDiscard = false;
     go("today");
     return;
@@ -1614,16 +1952,60 @@ function onClick(event) {
     go("today");
     return;
   }
-  if (act === "db-dec") setKg("dumbbellKg", state.gear.dumbbellKg - 1, 40);
-  if (act === "db-inc") setKg("dumbbellKg", state.gear.dumbbellKg + 1, 40);
-  if (act === "kb-dec") setKg("kettlebellKg", state.gear.kettlebellKg - 1, 48);
-  if (act === "kb-inc") setKg("kettlebellKg", state.gear.kettlebellKg + 1, 48);
+  if (act === "stale-finish") {
+    const now = new Date().toISOString();
+    const done = state.active ? state.active.ratings.filter((rating) => rating != null).length : 0;
+    persist(dismissSession(finishSession(fresh(), now, true)));
+    render();
+    showToast(`Saved ${done} ${done === 1 ? "move" : "moves"}. The lineup moves on.`);
+    return;
+  }
+  if (act === "stale-discard") {
+    const base = fresh();
+    base.active = null;
+    persist(base);
+    render();
+    return;
+  }
+  if (act === "export-share") return void exportBackup("share");
+  if (act === "export-download") return void exportBackup("download");
+  if (act === "export-copy") return void exportBackup("copy");
+  if (act === "import-paste") return void checkImport(document.getElementById("import-text")?.value);
+  if (act === "import-no") {
+    pendingImport = null;
+    render();
+    return;
+  }
+  if (act === "import-yes") {
+    if (!pendingImport) return;
+    const next = pendingImport.state;
+    pendingImport = null;
+    confirmDiscard = false;
+    persist(next);
+    go("today");
+    showToast("Backup restored.");
+    return;
+  }
+  if (act === "db-dec") setKg("dumbbellKg", state.gear.dumbbellKg - 0.5, 40);
+  if (act === "db-inc") setKg("dumbbellKg", state.gear.dumbbellKg + 0.5, 40);
+  if (act === "kb-dec") setKg("kettlebellKg", state.gear.kettlebellKg - 0.5, 48);
+  if (act === "kb-inc") setKg("kettlebellKg", state.gear.kettlebellKg + 0.5, 48);
 }
 
 function onChange(event) {
   const el = event.target;
   if (el.id === "db") setKg("dumbbellKg", el.value, 40);
   if (el.id === "kb") setKg("kettlebellKg", el.value, 48);
+  if (el.id === "import-file" && el.files && el.files[0]) {
+    el.files[0].text().then(checkImport, () => showToast("Could not read that file."));
+  }
+}
+
+function onToast(event) {
+  const btn = event.target.closest("[data-toast]");
+  if (!btn) return;
+  if (btn.dataset.toast === "reload") location.reload();
+  hideToast();
 }
 
 function boot() {
@@ -1631,9 +2013,30 @@ function boot() {
   if (!location.hash) history.replaceState(null, "", "#/today");
   document.body.addEventListener("click", onClick);
   document.body.addEventListener("change", onChange);
-  window.addEventListener("hashchange", render);
+  document.body.addEventListener("click", onToast);
+  window.addEventListener("hashchange", () => {
+    pendingImport = null;
+    copyFallback = "";
+    render();
+  });
   render();
+  if (navigator.storage && navigator.storage.persisted) {
+    navigator.storage.persisted().then((yes) => {
+      storagePersisted = yes;
+      if (!yes && !state.persistAsked && navigator.storage.persist) {
+        persist({ ...state, persistAsked: true });
+        return navigator.storage.persist().then((granted) => {
+          storagePersisted = granted;
+        });
+      }
+    }).then(() => { if (view === "gear") render(); }, () => {});
+  }
   if ("serviceWorker" in navigator) {
+    // Only offer a reload when a new version replaces one that was already running.
+    const hadController = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.addEventListener("controllerchange", () => {
+      if (hadController) showToast("Yield updated.", { sticky: true, action: "Tap to reload", act: "reload" });
+    });
     window.addEventListener("load", () => {
       navigator.serviceWorker.register("sw.js").catch((err) => console.warn("SW registration failed", err));
     });
